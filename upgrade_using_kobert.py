@@ -3,71 +3,111 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import Dataset, DataLoader
-from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup
+from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
+from transformers import AutoTokenizer, AutoModel, get_linear_schedule_with_warmup, get_cosine_schedule_with_warmup
 from sklearn.model_selection import train_test_split, StratifiedKFold
-from sklearn.metrics import roc_auc_score, accuracy_score, f1_score
+from sklearn.metrics import roc_auc_score, f1_score, accuracy_score
 from tqdm import tqdm
 import warnings
 import random
+import re
 warnings.filterwarnings('ignore')
 
-# 시드 고정
 def set_seed(seed=42):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
 
 set_seed(42)
+device = torch.device('cuda')
 
-# GPU 설정
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f'Using device: {device}')
-if torch.cuda.is_available():
-    print(f'GPU: {torch.cuda.get_device_name()}')
-    print(f'GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB')
-
-# A100 최적화 하이퍼파라미터
-MAX_LEN = 1024  # 긴 시퀀스 처리 (1024 시작, 메모리 여유 시 1536까지)
-BATCH_SIZE = 8  # A100에 최적화된 배치 크기
-EPOCHS = 4
-LEARNING_RATE = 1e-5  # 긴 시퀀스에서는 더 낮은 학습률
-WARMUP_RATIO = 0.1
+# KoBERT 극한 최적화 설정
+MAX_LEN = 512
+BATCH_SIZE = 16
+EPOCHS = 6                    # 충분한 학습
+LEARNING_RATE = 8e-6         # 정교한 학습률
+WARMUP_RATIO = 0.15          # 긴 워밍업
 WEIGHT_DECAY = 0.01
+DROPOUT_RATE = 0.15
 
-# 앙상블 설정 (시간 절약)
-ENSEMBLE_MODELS = [
-    'skt/kobert-base-v1',
-    'klue/bert-base'
-]
+# 고급 기법 활용
+USE_FOCAL_LOSS = True
+USE_LABEL_SMOOTHING = True
+USE_ADVERSARIAL = True
+USE_MIXUP = True
 USE_KFOLD = True
-N_FOLDS = 2  # 2-Fold로 시간 절약
+N_FOLDS = 5
 
-class LongSequenceDataset(Dataset):
-    """긴 시퀀스 전용 데이터셋 (청킹 없음)"""
-    def __init__(self, texts, labels=None, tokenizer=None, max_len=MAX_LEN):
+print("🔥 KoBERT 극한 최적화 모드")
+
+def advanced_text_preprocessing(text):
+    """고급 텍스트 전처리"""
+    if pd.isna(text):
+        return ""
+    
+    text = str(text).strip()
+    
+    # 연속된 공백 정리
+    text = re.sub(r'\s+', ' ', text)
+    
+    # 연속된 문장부호 정리
+    text = re.sub(r'[.]{2,}', '.', text)
+    text = re.sub(r'[!]{2,}', '!', text)
+    text = re.sub(r'[?]{2,}', '?', text)
+    
+    # 불필요한 기호 정리
+    text = re.sub(r'[^\w\s가-힣.,!?;:()\[\]{}"\'-]', ' ', text)
+    
+    # 다시 공백 정리
+    text = re.sub(r'\s+', ' ', text).strip()
+    
+    return text
+
+class AdvancedDataset(Dataset):
+    def __init__(self, texts, labels=None, tokenizer=None, is_train=False):
         self.texts = texts
         self.labels = labels
         self.tokenizer = tokenizer
-        self.max_len = max_len
+        self.is_train = is_train
         
     def __len__(self):
         return len(self.texts)
     
+    def text_augmentation(self, text):
+        """데이터 증강"""
+        if not self.is_train or random.random() > 0.3:
+            return text
+        
+        sentences = text.split('. ')
+        if len(sentences) > 3:
+            # 문장 순서 일부 섞기
+            if random.random() < 0.5:
+                mid = len(sentences) // 2
+                random.shuffle(sentences[1:mid])
+            
+            # 일부 문장 제거 (최대 20%)
+            if random.random() < 0.3:
+                remove_count = min(len(sentences) // 5, 2)
+                if remove_count > 0:
+                    indices = random.sample(range(1, len(sentences)-1), remove_count)
+                    sentences = [s for i, s in enumerate(sentences) if i not in indices]
+            
+            text = '. '.join(sentences)
+        
+        return text
+    
     def __getitem__(self, idx):
         text = str(self.texts.iloc[idx])
+        text = self.text_augmentation(text)
         
-        # 긴 시퀀스 직접 토크나이징 (청킹 없음)
         encoding = self.tokenizer(
             text,
             add_special_tokens=True,
-            max_length=self.max_len,
+            max_length=MAX_LEN,
             padding='max_length',
-            truncation=True,  # 너무 긴 경우에만 자름
+            truncation=True,
             return_attention_mask=True,
             return_tensors='pt'
         )
@@ -82,126 +122,172 @@ class LongSequenceDataset(Dataset):
             
         return result
 
-class LongSequenceBERTClassifier(nn.Module):
-    """긴 시퀀스 처리용 BERT 분류기"""
-    def __init__(self, model_name, num_classes=2, dropout_rate=0.15, model_idx=0):
-        super(LongSequenceBERTClassifier, self).__init__()
-        self.bert = AutoModel.from_pretrained(model_name)
-        self.model_name = model_name
-        self.model_idx = model_idx
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=1, gamma=2, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+    
+    def forward(self, inputs, targets):
+        ce_loss = F.cross_entropy(inputs, targets, reduction='none')
+        pt = torch.exp(-ce_loss)
+        focal_loss = self.alpha * (1-pt)**self.gamma * ce_loss
         
-        # A100에서는 더 적게 프리징 (메모리 충분)
-        freeze_layers = [4, 5][model_idx % 2]  # 더 많은 레이어 학습
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        return focal_loss
+
+class LabelSmoothingCrossEntropy(nn.Module):
+    def __init__(self, smoothing=0.1):
+        super().__init__()
+        self.smoothing = smoothing
+    
+    def forward(self, x, target):
+        confidence = 1. - self.smoothing
+        logprobs = F.log_softmax(x, dim=-1)
+        nll_loss = -logprobs.gather(dim=-1, index=target.unsqueeze(1))
+        nll_loss = nll_loss.squeeze(1)
+        smooth_loss = -logprobs.mean(dim=-1)
+        loss = confidence * nll_loss + self.smoothing * smooth_loss
+        return loss.mean()
+
+class ExtremeKoBERT(nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.bert = AutoModel.from_pretrained('skt/kobert-base-v1')
+        
+        # 최소한의 프리징 (성능 최우선)
         for param in self.bert.embeddings.parameters():
             param.requires_grad = False
-        for layer in self.bert.encoder.layer[:freeze_layers]:
+        for layer in self.bert.encoder.layer[:2]:  # 처음 2개만 프리징
             for param in layer.parameters():
                 param.requires_grad = False
         
         hidden_size = self.bert.config.hidden_size
         
-        # 긴 시퀀스용 고급 분류기
+        # 고성능 분류 헤드
         self.pre_classifier = nn.Sequential(
             nn.Linear(hidden_size, hidden_size),
             nn.LayerNorm(hidden_size),
+            nn.Tanh(),
+            nn.Dropout(DROPOUT_RATE)
+        )
+        
+        # Multi-layer 분류기
+        self.classifier = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size),
+            nn.LayerNorm(hidden_size),
             nn.ReLU(),
-            nn.Dropout(dropout_rate)
+            nn.Dropout(DROPOUT_RATE),
+            
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.LayerNorm(hidden_size // 2),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE // 2),
+            
+            nn.Linear(hidden_size // 2, hidden_size // 4),
+            nn.ReLU(),
+            nn.Dropout(DROPOUT_RATE // 2),
+            
+            nn.Linear(hidden_size // 4, 2)
         )
         
-        # 모델별 다른 분류기
-        if model_idx == 0:  # KoBERT
-            self.classifier = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size // 2),
-                nn.LayerNorm(hidden_size // 2),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden_size // 2, hidden_size // 4),
-                nn.ReLU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden_size // 4, num_classes)
-            )
-        else:  # KLUE-BERT
-            self.classifier = nn.Sequential(
-                nn.Linear(hidden_size, hidden_size),
-                nn.LayerNorm(hidden_size),
-                nn.GELU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden_size, hidden_size // 2),
-                nn.GELU(),
-                nn.Dropout(dropout_rate),
-                nn.Linear(hidden_size // 2, num_classes)
-            )
-        
-        # 어텐션 풀링 (긴 시퀀스에서 효과적)
-        self.attention_pooling = nn.MultiheadAttention(
-            hidden_size, num_heads=16, batch_first=True, dropout=dropout_rate
+        # 어텐션 풀링
+        self.attention_pool = nn.MultiheadAttention(
+            hidden_size, num_heads=12, batch_first=True, dropout=DROPOUT_RATE
         )
         
-    def forward(self, input_ids, attention_mask):
-        with torch.cuda.amp.autocast():
-            # BERT 인코딩
-            outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
-            
-            # 전체 시퀀스 사용
-            sequence_output = outputs.last_hidden_state  # [batch, seq_len, hidden]
-            
-            # 어텐션 풀링으로 중요한 부분에 집중
-            pooled_output, attention_weights = self.attention_pooling(
-                sequence_output, sequence_output, sequence_output,
-                key_padding_mask=(attention_mask == 0)
-            )
-            
-            # 가중 평균
-            mask_expanded = attention_mask.unsqueeze(-1).float()
-            weighted_output = (pooled_output * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
-            
-            # 분류
-            enhanced_output = self.pre_classifier(weighted_output)
-            enhanced_output = enhanced_output + weighted_output  # 잔차 연결
-            logits = self.classifier(enhanced_output)
+    def forward(self, input_ids, attention_mask, labels=None):
+        outputs = self.bert(input_ids=input_ids, attention_mask=attention_mask)
         
-        return logits, attention_weights
+        # 고급 풀링: 어텐션 + CLS
+        sequence_output = outputs.last_hidden_state
+        
+        # Self-attention pooling
+        attended_output, _ = self.attention_pool(
+            sequence_output, sequence_output, sequence_output,
+            key_padding_mask=(attention_mask == 0)
+        )
+        
+        # 가중 평균
+        mask_expanded = attention_mask.unsqueeze(-1).float()
+        weighted_output = (attended_output * mask_expanded).sum(dim=1) / mask_expanded.sum(dim=1)
+        
+        # CLS 토큰과 결합
+        if hasattr(outputs, 'pooler_output') and outputs.pooler_output is not None:
+            cls_output = outputs.pooler_output
+        else:
+            cls_output = sequence_output[:, 0, :]
+        
+        # 두 표현 결합
+        combined = weighted_output + cls_output
+        enhanced = self.pre_classifier(combined)
+        enhanced = enhanced + combined  # 잔차 연결
+        
+        logits = self.classifier(enhanced)
+        
+        return logits
 
-def analyze_text_lengths(texts):
-    """텍스트 길이 분석"""
-    lengths = texts.str.len()
-    print(f"\n📊 텍스트 길이 분석:")
-    print(f"  평균: {lengths.mean():.1f} 문자")
-    print(f"  중간값: {lengths.median():.1f} 문자")
-    print(f"  95th percentile: {lengths.quantile(0.95):.1f} 문자")
-    print(f"  99th percentile: {lengths.quantile(0.99):.1f} 문자")
-    print(f"  최대: {lengths.max()} 문자")
-    print(f"  1000자 이상: {(lengths > 1000).sum()}/{len(texts)} ({(lengths > 1000).mean()*100:.1f}%)")
-    print(f"  2000자 이상: {(lengths > 2000).sum()}/{len(texts)} ({(lengths > 2000).mean()*100:.1f}%)")
-    print(f"  3000자 이상: {(lengths > 3000).sum()}/{len(texts)} ({(lengths > 3000).mean()*100:.1f}%)")
-    
-    # MAX_LEN 추천
-    tokenizer_temp = AutoTokenizer.from_pretrained('klue/bert-base')
-    sample_tokens = []
-    for text in texts.sample(min(1000, len(texts))):
-        tokens = tokenizer_temp.encode(text, add_special_tokens=True)
-        sample_tokens.append(len(tokens))
-    
-    token_95th = np.percentile(sample_tokens, 95)
-    token_99th = np.percentile(sample_tokens, 99)
-    
-    print(f"\n🔤 토큰 길이 분석:")
-    print(f"  95th percentile: {token_95th:.0f} 토큰")
-    print(f"  99th percentile: {token_99th:.0f} 토큰")
-    
-    if token_95th <= 1024:
-        print(f"  ✅ MAX_LEN=1024 추천 (95% 커버)")
-    elif token_95th <= 1536:
-        print(f"  ⚠️ MAX_LEN=1536 권장 (95% 커버)")
+def mixup_data(x, y, alpha=0.2):
+    """Mixup 데이터 증강"""
+    if alpha > 0:
+        lam = np.random.beta(alpha, alpha)
     else:
-        print(f"  🚨 MAX_LEN=2048 고려 필요")
-
-def train_single_model(model, train_loader, val_loader, model_name, fold_idx=None):
-    """단일 모델 훈련 (긴 시퀀스 최적화)"""
-    criterion = nn.CrossEntropyLoss()
-    scaler = torch.cuda.amp.GradScaler()
+        lam = 1
     
-    # A100 최적화 옵티마이저
+    batch_size = x.size(0)
+    index = torch.randperm(batch_size).to(x.device)
+    
+    mixed_x = lam * x + (1 - lam) * x[index, :]
+    y_a, y_b = y, y[index]
+    return mixed_x, y_a, y_b, lam
+
+def mixup_criterion(criterion, pred, y_a, y_b, lam):
+    return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
+
+def adversarial_training(model, inputs, labels, optimizer, criterion, epsilon=0.01):
+    """적대적 훈련"""
+    embeddings = model.bert.embeddings.word_embeddings
+    
+    # 원본 임베딩 저장
+    original_embeddings = embeddings.weight.data.clone()
+    
+    # 그래디언트 계산을 위해 requires_grad 설정
+    embeddings.weight.requires_grad_()
+    
+    # Forward pass
+    logits = model(inputs['input_ids'], inputs['attention_mask'])
+    loss = criterion(logits, labels)
+    
+    # 임베딩에 대한 그래디언트 계산
+    loss.backward(retain_graph=True)
+    grad = embeddings.weight.grad.data
+    
+    # 적대적 perturbation 생성
+    perturbation = epsilon * grad.sign()
+    embeddings.weight.data = original_embeddings + perturbation
+    
+    # 적대적 샘플로 다시 계산
+    adv_logits = model(inputs['input_ids'], inputs['attention_mask'])
+    adv_loss = criterion(adv_logits, labels)
+    
+    # 원본 임베딩 복원
+    embeddings.weight.data = original_embeddings
+    embeddings.weight.requires_grad_(False)
+    
+    return adv_loss
+
+def train_extreme_kobert(model, train_loader, val_loader, fold=None):
+    # 고급 손실함수 조합
+    if USE_FOCAL_LOSS:
+        criterion = FocalLoss(alpha=1, gamma=2)
+    elif USE_LABEL_SMOOTHING:
+        criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
+    else:
+        criterion = nn.CrossEntropyLoss()
+    
+    # 고급 옵티마이저
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=LEARNING_RATE, 
@@ -212,294 +298,223 @@ def train_single_model(model, train_loader, val_loader, model_name, fold_idx=Non
     
     total_steps = len(train_loader) * EPOCHS
     warmup_steps = int(total_steps * WARMUP_RATIO)
-    scheduler = get_linear_schedule_with_warmup(
+    
+    # 코사인 스케줄러 사용
+    scheduler = get_cosine_schedule_with_warmup(
         optimizer,
         num_warmup_steps=warmup_steps,
         num_training_steps=total_steps
     )
     
     best_auc = 0
-    best_model_state = None
+    best_state = None
+    patience = 0
+    max_patience = 3
     
-    fold_str = f"Fold {fold_idx+1}" if fold_idx is not None else "Single"
-    model_name_short = model_name.split('/')[-1]
+    fold_str = f"Fold{fold}" if fold is not None else "Single"
     
     for epoch in range(EPOCHS):
         # 훈련
         model.train()
         total_loss = 0
-        correct_predictions = 0
         
-        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f'{fold_str} {model_name_short} Epoch {epoch+1}')):
+        for batch_idx, batch in enumerate(tqdm(train_loader, desc=f'{fold_str}-E{epoch+1}')):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             labels = batch['labels'].to(device)
             
             optimizer.zero_grad()
             
-            with torch.cuda.amp.autocast():
-                logits, attention_weights = model(input_ids=input_ids, attention_mask=attention_mask)
+            inputs = {'input_ids': input_ids, 'attention_mask': attention_mask}
+            
+            # Mixup 적용
+            if USE_MIXUP and random.random() < 0.3:
+                mixed_inputs, y_a, y_b, lam = mixup_data(input_ids, labels)
+                inputs['input_ids'] = mixed_inputs
+                logits = model(**inputs)
+                loss = mixup_criterion(criterion, logits, y_a, y_b, lam)
+            else:
+                logits = model(**inputs)
                 loss = criterion(logits, labels)
             
-            _, preds = torch.max(logits, dim=1)
-            correct_predictions += torch.sum(preds == labels)
-            total_loss += loss.item()
+            # 적대적 훈련 (일부 배치에서)
+            if USE_ADVERSARIAL and batch_idx % 3 == 0:
+                adv_loss = adversarial_training(model, inputs, labels, optimizer, criterion)
+                loss = 0.7 * loss + 0.3 * adv_loss
             
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
+            loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             scheduler.step()
             
-            # 긴 시퀀스로 인한 메모리 관리
-            if batch_idx % 20 == 0:
-                torch.cuda.empty_cache()
-        
-        train_loss = total_loss / len(train_loader)
-        train_acc = correct_predictions.double() / len(train_loader.dataset)
+            total_loss += loss.item()
         
         # 검증
         model.eval()
-        val_loss = 0
-        val_predictions = []
-        val_probabilities = []
-        val_labels = []
+        val_probs, val_labels = [], []
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc='Validation'):
+            for batch in val_loader:
                 input_ids = batch['input_ids'].to(device)
                 attention_mask = batch['attention_mask'].to(device)
                 labels = batch['labels'].to(device)
                 
-                with torch.cuda.amp.autocast():
-                    logits, _ = model(input_ids=input_ids, attention_mask=attention_mask)
-                    loss = criterion(logits, labels)
-                
-                val_loss += loss.item()
+                logits = model(input_ids, attention_mask)
                 probs = torch.softmax(logits, dim=1)
-                val_probabilities.extend(probs[:, 1].cpu().numpy())
+                
+                val_probs.extend(probs[:, 1].cpu().numpy())
                 val_labels.extend(labels.cpu().numpy())
         
-        val_loss /= len(val_loader)
-        val_auc = roc_auc_score(val_labels, val_probabilities)
-        val_f1 = f1_score(val_labels, [1 if p > 0.5 else 0 for p in val_probabilities])
+        # 메트릭 계산
+        auc = roc_auc_score(val_labels, val_probs)
+        f1 = f1_score(val_labels, [1 if p > 0.5 else 0 for p in val_probs])
+        acc = accuracy_score(val_labels, [1 if p > 0.5 else 0 for p in val_probs])
         
-        print(f'  Epoch {epoch+1}: Train Loss: {train_loss:.4f}, Train Acc: {train_acc:.4f}')
-        print(f'             Val Loss: {val_loss:.4f}, Val AUC: {val_auc:.4f}, Val F1: {val_f1:.4f}')
+        avg_loss = total_loss / len(train_loader)
+        current_lr = scheduler.get_last_lr()[0]
         
-        if val_auc > best_auc:
-            best_auc = val_auc
-            best_model_state = model.state_dict().copy()
-            print(f'  🎯 New best AUC: {best_auc:.4f}')
+        print(f'  E{epoch+1}: Loss={avg_loss:.4f}, AUC={auc:.4f}, F1={f1:.4f}, Acc={acc:.4f}, LR={current_lr:.2e}')
         
-        # GPU 메모리 상태
-        if torch.cuda.is_available():
-            memory_allocated = torch.cuda.memory_allocated() / 1024**3
-            print(f'  GPU Memory: {memory_allocated:.2f}GB')
+        # Early stopping with patience
+        if auc > best_auc:
+            best_auc = auc
+            best_state = model.state_dict().copy()
+            patience = 0
+            print(f'    🚀 New best AUC: {best_auc:.4f}')
+        else:
+            patience += 1
+            if patience >= max_patience:
+                print(f'    Early stopping at epoch {epoch+1}')
+                break
     
-    model.load_state_dict(best_model_state)
+    model.load_state_dict(best_state)
     return model, best_auc
 
-def predict_with_model(model, data_loader):
-    """단일 모델로 예측"""
+def predict_extreme(model, test_loader):
     model.eval()
     predictions = []
     
     with torch.no_grad():
-        for batch in tqdm(data_loader, desc='Predicting'):
+        for batch in tqdm(test_loader, desc='Extreme Prediction'):
             input_ids = batch['input_ids'].to(device)
             attention_mask = batch['attention_mask'].to(device)
             
-            with torch.cuda.amp.autocast():
-                logits, _ = model(input_ids=input_ids, attention_mask=attention_mask)
-            
+            logits = model(input_ids, attention_mask)
             probs = torch.softmax(logits, dim=1)
             predictions.extend(probs[:, 1].cpu().numpy())
     
     return np.array(predictions)
 
-def ensemble_predict(models, tokenizers, test_data, weights=None):
-    """앙상블 예측"""
-    if weights is None:
-        weights = [1.0] * len(models)
-    
-    all_predictions = []
-    
-    for i, (model, tokenizer) in enumerate(zip(models, tokenizers)):
-        print(f"\n예측 중: {ENSEMBLE_MODELS[i].split('/')[-1]}")
-        
-        test_dataset = LongSequenceDataset(test_data, labels=None, tokenizer=tokenizer, max_len=MAX_LEN)
-        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-        
-        predictions = predict_with_model(model, test_loader)
-        all_predictions.append(predictions * weights[i])
-    
-    # 가중 평균
-    ensemble_predictions = np.mean(all_predictions, axis=0)
-    return ensemble_predictions
-
 def main():
-    print("=== 🚀 A100 Long Sequence Ensemble Training ===")
-    print("Loading data...")
+    print("🔥 KoBERT 극한 최적화 시작!")
     
     # 데이터 로드
     train = pd.read_csv('./train.csv', encoding='utf-8-sig')
     test = pd.read_csv('./test.csv', encoding='utf-8-sig')
     
-    print(f"Train shape: {train.shape}")
-    print(f"Test shape: {test.shape}")
+    print(f"Train: {len(train)}, Test: {len(test)}")
     
-    # 텍스트 전처리
-    print("Preprocessing text data...")
+    # 고급 전처리
+    print("고급 텍스트 전처리...")
+    train['title'] = train['title'].apply(advanced_text_preprocessing)
+    train['full_text'] = train['full_text'].apply(advanced_text_preprocessing)
+    train['text'] = train['title'] + ' [SEP] ' + train['full_text']
     
-    train['title'] = train['title'].fillna('').str.strip()
-    train['full_text'] = train['full_text'].fillna('').str.replace(r'\n\s*\n', '\n', regex=True).str.strip()
-    train['combined_text'] = train['title'] + ' [SEP] ' + train['full_text']
+    test = test.rename(columns={'paragraph_text': 'full_text'})
+    test['title'] = test['title'].apply(advanced_text_preprocessing)
+    test['full_text'] = test['full_text'].apply(advanced_text_preprocessing)
+    test['text'] = test['title'] + ' [SEP] ' + test['full_text']
     
     # 텍스트 길이 분석
-    analyze_text_lengths(train['combined_text'])
+    lengths = train['text'].str.len()
+    print(f"텍스트 길이 - 평균: {lengths.mean():.0f}, 최대: {lengths.max()}, 95%ile: {lengths.quantile(0.95):.0f}")
     
-    X = train['combined_text']
+    X = train['text']
     y = train['generated']
+    print(f"클래스 분포: {y.value_counts().to_dict()}")
     
-    print(f"\nClass distribution: {y.value_counts().to_dict()}")
+    # KoBERT 토크나이저
+    tokenizer = AutoTokenizer.from_pretrained('skt/kobert-base-v1')
     
-    # 앙상블 모델들과 토크나이저들
-    ensemble_models = []
-    ensemble_tokenizers = []
-    model_weights = []
-    
-    print(f"\n🎯 A100 Long Sequence 앙상블 훈련 시작")
-    print(f"설정: MAX_LEN={MAX_LEN}, BATCH_SIZE={BATCH_SIZE}, {N_FOLDS}-Fold")
-    
-    for model_idx, model_name in enumerate(ENSEMBLE_MODELS):
-        print(f"\n{'='*60}")
-        print(f"모델 {model_idx+1}/{len(ENSEMBLE_MODELS)}: {model_name}")
-        print(f"{'='*60}")
+    if USE_KFOLD:
+        # K-Fold 교차 검증
+        print(f"\n{N_FOLDS}-Fold 교차 검증 시작")
+        fold_predictions = []
+        fold_aucs = []
         
-        # 토크나이저 로드
-        try:
-            tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=False)
-            print(f"Successfully loaded tokenizer: {model_name}")
-        except:
-            try:
-                tokenizer = AutoTokenizer.from_pretrained(model_name, use_fast=True)
-                print(f"Loaded fast tokenizer: {model_name}")
-            except Exception as e:
-                print(f"Failed to load {model_name}: {e}")
-                continue
+        skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
         
-        if USE_KFOLD:
-            # K-Fold 교차 검증
-            fold_aucs = []
+        for fold, (train_idx, val_idx) in enumerate(skf.split(X, y)):
+            print(f"\n{'='*50}")
+            print(f"Fold {fold+1}/{N_FOLDS}")
+            print(f"{'='*50}")
             
-            skf = StratifiedKFold(n_splits=N_FOLDS, shuffle=True, random_state=42)
+            X_train, X_val = X.iloc[train_idx], X.iloc[val_idx]
+            y_train, y_val = y.iloc[train_idx], y.iloc[val_idx]
             
-            for fold_idx, (train_idx, val_idx) in enumerate(skf.split(X, y)):
-                print(f"\n--- Fold {fold_idx+1}/{N_FOLDS} ---")
-                
-                X_train_fold, X_val_fold = X.iloc[train_idx], X.iloc[val_idx]
-                y_train_fold, y_val_fold = y.iloc[train_idx], y.iloc[val_idx]
-                
-                # 긴 시퀀스 데이터셋 생성
-                train_dataset = LongSequenceDataset(X_train_fold, y_train_fold, tokenizer, MAX_LEN)
-                val_dataset = LongSequenceDataset(X_val_fold, y_val_fold, tokenizer, MAX_LEN)
-                
-                train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-                val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
-                
-                # 긴 시퀀스 모델 초기화
-                model = LongSequenceBERTClassifier(model_name, num_classes=2, model_idx=model_idx)
-                model = model.to(device)
-                
-                # 훈련
-                trained_model, fold_auc = train_single_model(
-                    model, train_loader, val_loader, model_name, fold_idx
-                )
-                
-                fold_aucs.append(fold_auc)
-                
-                # 첫 번째 폴드 모델만 저장 (앙상블용)
-                if fold_idx == 0:
-                    ensemble_models.append(trained_model)
-                    ensemble_tokenizers.append(tokenizer)
-                
-                torch.cuda.empty_cache()
+            # 가중 샘플링
+            class_counts = y_train.value_counts()
+            class_weights = {0: 1.0, 1: class_counts[0] / class_counts[1]}
+            sample_weights = y_train.map(class_weights)
+            sampler = WeightedRandomSampler(sample_weights, len(sample_weights))
             
-            avg_auc = np.mean(fold_aucs)
-            model_weights.append(avg_auc)
-            print(f"\n{model_name} K-Fold 평균 AUC: {avg_auc:.4f}")
+            # 데이터셋
+            train_dataset = AdvancedDataset(X_train, y_train, tokenizer, is_train=True)
+            val_dataset = AdvancedDataset(X_val, y_val, tokenizer, is_train=False)
             
-        else:
-            # 단일 학습
-            X_train, X_val, y_train, y_val = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+            train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, sampler=sampler, num_workers=4, pin_memory=True)
+            val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE*2, shuffle=False, num_workers=4, pin_memory=True)
             
-            train_dataset = LongSequenceDataset(X_train, y_train, tokenizer, MAX_LEN)
-            val_dataset = LongSequenceDataset(X_val, y_val, tokenizer, MAX_LEN)
+            # 모델 훈련
+            model = ExtremeKoBERT().to(device)
+            model, fold_auc = train_extreme_kobert(model, train_loader, val_loader, fold+1)
             
-            train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
-            val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=4, pin_memory=True)
+            fold_aucs.append(fold_auc)
             
-            model = LongSequenceBERTClassifier(model_name, num_classes=2, model_idx=model_idx)
-            model = model.to(device)
-            
-            trained_model, auc = train_single_model(model, train_loader, val_loader, model_name)
-            
-            ensemble_models.append(trained_model)
-            ensemble_tokenizers.append(tokenizer)
-            model_weights.append(auc)
-            
-            print(f"\n{model_name} AUC: {auc:.4f}")
+            # 첫 번째 폴드 모델 저장 (테스트용)
+            if fold == 0:
+                best_model = model
+        
+        avg_auc = np.mean(fold_aucs)
+        std_auc = np.std(fold_aucs)
+        print(f"\n🎯 K-Fold 결과: AUC = {avg_auc:.4f} ± {std_auc:.4f}")
+        print(f"Fold AUCs: {[f'{auc:.4f}' for auc in fold_aucs]}")
+        
+    else:
+        # 단일 훈련
+        X_train, X_val, y_train, y_val = train_test_split(X, y, stratify=y, test_size=0.2, random_state=42)
+        
+        train_dataset = AdvancedDataset(X_train, y_train, tokenizer, is_train=True)
+        val_dataset = AdvancedDataset(X_val, y_val, tokenizer, is_train=False)
+        
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4, pin_memory=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE*2, shuffle=False, num_workers=4, pin_memory=True)
+        
+        best_model = ExtremeKoBERT().to(device)
+        best_model, best_auc = train_extreme_kobert(best_model, train_loader, val_loader)
+        print(f"\n🎯 최종 AUC: {best_auc:.4f}")
     
-    # 가중치 정규화
-    total_weight = sum(model_weights)
-    normalized_weights = [w / total_weight for w in model_weights]
+    # 테스트 예측
+    print("\n🚀 극한 성능 예측 시작...")
+    test_dataset = AdvancedDataset(test['text'], labels=None, tokenizer=tokenizer)
+    test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE*2, shuffle=False, num_workers=4, pin_memory=True)
     
-    print(f"\n🎯 앙상블 가중치:")
-    for i, (model_name, weight) in enumerate(zip(ENSEMBLE_MODELS, normalized_weights)):
-        print(f"  {model_name.split('/')[-1]}: {weight:.3f}")
+    predictions = predict_extreme(best_model, test_loader)
     
-    # 테스트 데이터 전처리
-    print("\n테스트 데이터 전처리...")
-    test = test.rename(columns={'paragraph_text': 'full_text'})
-    test['title'] = test['title'].fillna('').str.strip()
-    test['full_text'] = test['full_text'].fillna('').str.replace(r'\n\s*\n', '\n', regex=True).str.strip()
-    test['combined_text'] = test['title'] + ' [SEP] ' + test['full_text']
+    print(f"\n📊 예측 결과:")
+    print(f"  범위: {predictions.min():.4f} - {predictions.max():.4f}")
+    print(f"  평균: {predictions.mean():.4f}")
+    print(f"  표준편차: {predictions.std():.4f}")
     
-    # 테스트 데이터 길이 분석
-    analyze_text_lengths(test['combined_text'])
+    # 제출 파일
+    submission = pd.read_csv('./sample_submission.csv', encoding='utf-8-sig')
+    submission['generated'] = predictions
+    submission.to_csv('./extreme_kobert_submission.csv', index=False)
     
-    # 앙상블 예측
-    print("\n🚀 A100 긴 시퀀스 앙상블 예측 시작...")
-    ensemble_predictions = ensemble_predict(
-        ensemble_models, ensemble_tokenizers, test['combined_text'], normalized_weights
-    )
-    
-    print(f"\n📊 앙상블 예측 통계:")
-    print(f"  예측 개수: {len(ensemble_predictions)}")
-    print(f"  확률 범위: {ensemble_predictions.min():.4f} - {ensemble_predictions.max():.4f}")
-    print(f"  평균 확률: {ensemble_predictions.mean():.4f}")
-    print(f"  표준편차: {ensemble_predictions.std():.4f}")
-    
-    # 제출 파일 생성
-    sample_submission = pd.read_csv('./sample_submission.csv', encoding='utf-8-sig')
-    sample_submission['generated'] = ensemble_predictions
-    sample_submission.to_csv('./long_sequence_submission.csv', index=False)
-    
-    print(f"\n🎉 A100 긴 시퀀스 앙상블 훈련 완료!")
-    print(f"📊 최종 결과:")
-    print(f"  시퀀스 길이: {MAX_LEN} (청킹 없음)")
-    print(f"  앙상블 모델 수: {len(ensemble_models)}")
-    print(f"  사용된 모델들:")
-    for i, model_name in enumerate(ENSEMBLE_MODELS):
-        print(f"    {i+1}. {model_name} (가중치: {normalized_weights[i]:.3f})")
-    print(f"  K-Fold: {N_FOLDS}-Fold")
-    print(f"  제출 파일: long_sequence_submission.csv")
-    print(f"  예상 성능: 기존 대비 +3~6% (정보 손실 최소화)")
-    
-    torch.cuda.empty_cache()
-    print(sample_submission.head())
+    print(f"\n🔥 KoBERT 극한 최적화 완료!")
+    print(f"📁 제출 파일: extreme_kobert_submission.csv")
+    print(f"🎯 목표: AUC 0.90+ 달성!")
+    print(submission.head())
 
 if __name__ == "__main__":
     main()
